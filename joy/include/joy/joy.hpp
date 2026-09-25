@@ -32,6 +32,7 @@
 
 #include <SDL.h>
 
+#include <chrono>
 #include <future>
 #include <memory>
 #include <string>
@@ -56,6 +57,13 @@ public:
   ~Joy() override;
 
 private:
+  enum class ConnectionState
+  {
+    DISCONNECTED,
+    WAITING_FOR_NEUTRAL,
+    READY
+  };
+
   void eventThread();
   bool handleJoyAxis(const SDL_Event & e);
   bool handleJoyButtonDown(const SDL_Event & e);
@@ -63,6 +71,10 @@ private:
   bool handleJoyHatMotion(const SDL_Event & e);
   void handleJoyDeviceAdded(const SDL_Event & e);
   void handleJoyDeviceRemoved(const SDL_Event & e);
+  void scanForJoystick();
+  void openJoystick(int device_id);
+  void reinitializeJoystickSubsystem();
+  bool joystickIsNeutral();
   float convertRawAxisValueToROS(int16_t val);
   void feedbackCb(const std::shared_ptr<sensor_msgs::msg::JoyFeedback> msg);
 
@@ -80,7 +92,11 @@ private:
   bool publish_soon_{false};
   rclcpp::Time publish_soon_time_;
   int coalesce_interval_ms_{0};
+  int neutral_dwell_ms_{0};
   std::string dev_name_;
+  ConnectionState connection_state_{ConnectionState::DISCONNECTED};
+  bool neutral_seen_{false};
+  std::chrono::steady_clock::time_point neutral_since_;
   std::thread event_thread_;
   std::shared_future<void> future_;
   std::promise<void> exit_signal_;

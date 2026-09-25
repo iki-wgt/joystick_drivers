@@ -92,6 +92,10 @@ Joy::Joy(const rclcpp::NodeOptions & options)
   if (coalesce_interval_ms_ < 0) {
     throw std::runtime_error("coalesce_interval_ms must be positive");
   }
+  neutral_dwell_ms_ = static_cast<int>(this->declare_parameter("neutral_dwell_ms", 500));
+  if (neutral_dwell_ms_ < 0) {
+    throw std::runtime_error("neutral_dwell_ms must be positive");
+  }
   // Make sure to initialize publish_soon_time regardless of whether we are going
   // to use it; this ensures that we are always using the correct time source.
   publish_soon_time_ = this->now();
@@ -105,7 +109,7 @@ Joy::Joy(const rclcpp::NodeOptions & options)
 
   future_ = exit_signal_.get_future();
 
-  if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
+  if (SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
     throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
   }
   // In theory we could do this with just a timer, which would simplify the code
@@ -124,7 +128,7 @@ Joy::~Joy()
   if (joystick_ != nullptr) {
     SDL_JoystickClose(joystick_);
   }
-  SDL_Quit();
+  SDL_QuitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC);
 }
 
 void Joy::feedbackCb(const std::shared_ptr<sensor_msgs::msg::JoyFeedback> msg)
@@ -333,19 +337,57 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
     }
   }
 
-  if (e.jdevice.which != dev_id_) {
+  if (joystick_ != nullptr || e.jdevice.which != dev_id_) {
     return;
   }
 
-  joystick_ = SDL_JoystickOpen(dev_id_);
+  openJoystick(dev_id_);
+}
+
+void Joy::scanForJoystick()
+{
+  if (joystick_ != nullptr) {
+    return;
+  }
+
+  const int num_joysticks = SDL_NumJoysticks();
+  if (num_joysticks < 0) {
+    RCLCPP_WARN(get_logger(), "Failed to get the number of joysticks: %s", SDL_GetError());
+    return;
+  }
+
+  if (!dev_name_.empty()) {
+    for (int i = 0; i < num_joysticks; ++i) {
+      const char * name = SDL_JoystickNameForIndex(i);
+      if (name == nullptr) {
+        RCLCPP_WARN(get_logger(), "Could not get joystick name: %s", SDL_GetError());
+        continue;
+      }
+      if (std::string(name) == dev_name_) {
+        dev_id_ = i;
+        openJoystick(dev_id_);
+        return;
+      }
+    }
+    return;
+  }
+
+  if (dev_id_ < num_joysticks) {
+    openJoystick(dev_id_);
+  }
+}
+
+void Joy::openJoystick(int device_id)
+{
+  joystick_ = SDL_JoystickOpen(device_id);
   if (joystick_ == nullptr) {
-    RCLCPP_WARN(get_logger(), "Unable to open joystick %d: %s", dev_id_, SDL_GetError());
+    RCLCPP_WARN(get_logger(), "Unable to open joystick %d: %s", device_id, SDL_GetError());
     return;
   }
 
   // We need to hold onto this so that we can properly remove it on a
   // remove event.
-  joystick_instance_id_ = SDL_JoystickGetDeviceInstanceID(dev_id_);
+  joystick_instance_id_ = SDL_JoystickGetDeviceInstanceID(device_id);
   if (joystick_instance_id_ < 0) {
     RCLCPP_WARN(get_logger(), "Failed to get instance ID for joystick: %s", SDL_GetError());
     SDL_JoystickClose(joystick_);
@@ -360,7 +402,7 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
     joystick_ = nullptr;
     return;
   }
-  joy_msg_.buttons.resize(num_buttons);
+  joy_msg_.buttons.assign(num_buttons, 0);
 
   int num_axes = SDL_JoystickNumAxes(joystick_);
   if (num_axes < 0) {
@@ -376,15 +418,7 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
     joystick_ = nullptr;
     return;
   }
-  joy_msg_.axes.resize(num_axes + num_hats * 2);
-
-  // Get the initial state for each of the axes
-  for (int i = 0; i < num_axes; ++i) {
-    int16_t state;
-    if (SDL_JoystickGetAxisInitialState(joystick_, i, &state)) {
-      joy_msg_.axes.at(i) = convertRawAxisValueToROS(state);
-    }
-  }
+  joy_msg_.axes.assign(num_axes + num_hats * 2, 0.0F);
 
   haptic_ = SDL_HapticOpenFromJoystick(joystick_);
   if (haptic_ != nullptr) {
@@ -400,6 +434,49 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
   RCLCPP_INFO(
     get_logger(), "Opened joystick: %s.  deadzone: %f",
     SDL_JoystickName(joystick_), scaled_deadzone_);
+
+  connection_state_ = ConnectionState::WAITING_FOR_NEUTRAL;
+  neutral_seen_ = false;
+  publish_soon_ = false;
+  RCLCPP_INFO(get_logger(), "Waiting for joystick controls to return to neutral");
+}
+
+void Joy::reinitializeJoystickSubsystem()
+{
+  SDL_QuitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC);
+  if (SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
+    throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
+  }
+}
+
+bool Joy::joystickIsNeutral()
+{
+  SDL_JoystickUpdate();
+
+  const int num_axes = SDL_JoystickNumAxes(joystick_);
+  const int num_buttons = SDL_JoystickNumButtons(joystick_);
+  const int num_hats = SDL_JoystickNumHats(joystick_);
+  if (num_axes < 0 || num_buttons < 0 || num_hats < 0) {
+    RCLCPP_WARN(get_logger(), "Failed to read joystick state: %s", SDL_GetError());
+    return false;
+  }
+
+  for (int i = 0; i < num_axes; ++i) {
+    if (convertRawAxisValueToROS(SDL_JoystickGetAxis(joystick_, i)) != 0.0F) {
+      return false;
+    }
+  }
+  for (int i = 0; i < num_buttons; ++i) {
+    if (SDL_JoystickGetButton(joystick_, i) != 0) {
+      return false;
+    }
+  }
+  for (int i = 0; i < num_hats; ++i) {
+    if (SDL_JoystickGetHat(joystick_, i) != SDL_HAT_CENTERED) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void Joy::handleJoyDeviceRemoved(const SDL_Event & e)
@@ -418,6 +495,9 @@ void Joy::handleJoyDeviceRemoved(const SDL_Event & e)
     SDL_JoystickClose(joystick_);
     joystick_ = nullptr;
   }
+  connection_state_ = ConnectionState::DISCONNECTED;
+  neutral_seen_ = false;
+  publish_soon_ = false;
 }
 
 void Joy::eventThread()
@@ -426,6 +506,39 @@ void Joy::eventThread()
   rclcpp::Time last_publish = this->now();
 
   do {
+    if (joystick_ == nullptr) {
+      // Containers can observe new /dev/input entries without receiving SDL's
+      // hotplug event.  Reinitialize and enumerate explicitly while disconnected.
+      reinitializeJoystickSubsystem();
+      scanForJoystick();
+      if (joystick_ == nullptr) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        status = future_.wait_for(std::chrono::seconds(0));
+        continue;
+      }
+    }
+
+    if (connection_state_ == ConnectionState::WAITING_FOR_NEUTRAL) {
+      if (joystickIsNeutral()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!neutral_seen_) {
+          neutral_since_ = now;
+          neutral_seen_ = true;
+        } else {
+          const auto neutral_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - neutral_since_);
+          if (neutral_duration.count() >= neutral_dwell_ms_) {
+            SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_JOYBUTTONUP);
+            connection_state_ = ConnectionState::READY;
+            publish_soon_ = false;
+            RCLCPP_INFO(get_logger(), "Joystick controls are neutral; ready to publish events");
+          }
+        }
+      } else {
+        neutral_seen_ = false;
+      }
+    }
+
     bool should_publish = false;
     SDL_Event e;
     int wait_time_ms = autorepeat_interval_ms_;
@@ -436,13 +549,21 @@ void Joy::eventThread()
     if (success == 1) {
       // Succeeded getting an event
       if (e.type == SDL_JOYAXISMOTION) {
-        should_publish = handleJoyAxis(e);
+        if (connection_state_ == ConnectionState::READY) {
+          should_publish = handleJoyAxis(e);
+        }
       } else if (e.type == SDL_JOYBUTTONDOWN) {
-        should_publish = handleJoyButtonDown(e);
+        if (connection_state_ == ConnectionState::READY) {
+          should_publish = handleJoyButtonDown(e);
+        }
       } else if (e.type == SDL_JOYBUTTONUP) {
-        should_publish = handleJoyButtonUp(e);
+        if (connection_state_ == ConnectionState::READY) {
+          should_publish = handleJoyButtonUp(e);
+        }
       } else if (e.type == SDL_JOYHATMOTION) {
-        should_publish = handleJoyHatMotion(e);
+        if (connection_state_ == ConnectionState::READY) {
+          should_publish = handleJoyHatMotion(e);
+        }
       } else if (e.type == SDL_JOYDEVICEADDED) {
         handleJoyDeviceAdded(e);
       } else if (e.type == SDL_JOYDEVICEREMOVED) {
@@ -452,7 +573,7 @@ void Joy::eventThread()
       }
     }
 
-    if (!should_publish) {
+    if (!should_publish && connection_state_ == ConnectionState::READY) {
       // So far, nothing has indicated that we should publish.  However we need to
       // do additional checking since there are several possible reasons:
       // 1.  SDL_WaitEventTimeout failed
